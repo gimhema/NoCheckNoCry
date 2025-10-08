@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # compile_preprocessor.py
 # Heuristic, compiler-agnostic static checks for C/C++ projects.
-import sys, os, re, io, pathlib, collections
+import sys, os, re, io, pathlib, collections, argparse
 
 SRC_EXT = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp"}
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"')
@@ -25,9 +25,12 @@ GLOBAL_ASSIGN_ADDR_RE = re.compile(r'\b(?:[A-Za-z_]\w*::)*[A-Za-z_]\w+\s*=\s*&\s
 
 Issue = collections.namedtuple("Issue", "tag file line col msg snippet")
 
-def iter_files(root):
+def iter_files(root, exclude_patterns):
+    def excluded(p: pathlib.Path) -> bool:
+        s = str(p.as_posix())
+        return any(x in s for x in exclude_patterns)
     for p in pathlib.Path(root).rglob("*"):
-        if p.is_file() and p.suffix.lower() in SRC_EXT:
+        if p.is_file() and p.suffix.lower() in SRC_EXT and not excluded(p):
             yield p
 
 def read_text(path):
@@ -39,20 +42,18 @@ def read_text(path):
         except Exception:
             return ""
 
-def build_include_graph(root):
+def build_include_graph(root, exclude_patterns):
     graph = collections.defaultdict(set)
     path_index = {}
-    for p in iter_files(root):
+    for p in iter_files(root, exclude_patterns):
         path_index[p.name] = p
-    for p in iter_files(root):
+    for p in iter_files(root, exclude_patterns):
         txt = read_text(p)
         for i, line in enumerate(txt.splitlines(), 1):
             m = INCLUDE_RE.match(line)
             if not m: continue
             inc = m.group(1)
-            # resolve include if exists in tree
             cand = None
-            # try relative to current dir
             rel = (p.parent / inc).resolve()
             if rel.exists(): cand = rel
             elif inc in path_index: cand = path_index[inc]
@@ -63,14 +64,12 @@ def build_include_graph(root):
 def find_include_cycles(graph):
     visited, stack = set(), set()
     cycles = []
-
     def dfs(u, path):
         visited.add(u); stack.add(u)
         for v in graph.get(u, ()):
             if v not in visited:
                 dfs(v, path + [v])
             elif v in stack:
-                # cycle detected; extract cycle segment
                 if v in path:
                     i = path.index(v)
                     cyc = path[i:] + [v]
@@ -78,11 +77,9 @@ def find_include_cycles(graph):
                     cyc = [v, u, v]
                 cycles.append(cyc)
         stack.remove(u)
-
     for node in list(graph.keys()):
         if node not in visited:
             dfs(node, [node])
-    # dedup by normalized tuple
     seen = set(); out = []
     for cyc in cycles:
         key = tuple(sorted(cyc))
@@ -91,16 +88,12 @@ def find_include_cycles(graph):
     return out
 
 def split_functions(text):
-    # Very heuristic: find signatures that end with '{' and then match braces to the end.
     funcs = []
     lines = text.splitlines()
     joined = "\n".join(lines)
     for m in FUNC_SIG_RE.finditer(joined):
-        start = m.start()
-        # find opening brace
         brace_pos = joined.find("{", m.end()-1)
         if brace_pos == -1: continue
-        # scan braces
         depth = 0; i = brace_pos; end = None
         while i < len(joined):
             ch = joined[i]
@@ -111,18 +104,15 @@ def split_functions(text):
                     end = i + 1; break
             i += 1
         if end:
-            # compute line/col
             pre = joined[:brace_pos]
             start_line = pre.count("\n") + 1
-            funcs.append((start_line, joined[ m.start(): end ]))
+            funcs.append((start_line, joined[m.start(): end ]))
     return funcs
 
 def collect_local_vars(func_text):
-    # naive: collect simple local names after first '{'
     body = func_text[func_text.find('{')+1: func_text.rfind('}')]
     locals_set = set()
     for line in body.splitlines():
-        # strip comments
         code = line.split("//",1)[0]
         for m in VAR_DECL_RE.finditer(code):
             locals_set.add(m.group(1))
@@ -142,7 +132,6 @@ def scan_guards(window_lines):
         for rx in GUARD_HINTS:
             gm = rx.search(s)
             if gm:
-                # last capturing group with variable
                 for g in gm.groups()[::-1]:
                     if g and g != 'nullptr' and g != '!':
                         if re.match(r'[A-Za-z_]\w*', g):
@@ -150,35 +139,25 @@ def scan_guards(window_lines):
                             break
     return guards
 
-def analyze_file(path, issues):
+def analyze_file(path, issues, lookback):
     txt = read_text(path)
     if not txt: return
-    # function-wise scan
     funcs = split_functions(txt)
-    lines = txt.splitlines()
-
     for f_start_line, ftxt in funcs:
         locals_set = collect_local_vars(ftxt)
         params = extract_params(ftxt)
         body = ftxt[ftxt.find('{')+1: ftxt.rfind('}')]
         body_lines = body.splitlines()
-
-        # sliding window for guards (lookback 6 lines by default)
-        lookback = 6
         for idx, raw in enumerate(body_lines):
             line = raw.split("//",1)[0]
             ln = f_start_line + idx + 1
-            # --- rule: RAW-DELETE
             dm = DELETE_RE.search(line)
             if dm:
-                col = dm.start()+1
-                issues.append(Issue("RAW-DELETE", path, ln, col,
+                issues.append(Issue("RAW-DELETE", path, ln, dm.start()+1,
                     "Avoid raw 'delete'/'delete[]' — prefer RAII (unique_ptr/shared_ptr) or custom deleter.",
                     raw.strip()))
-            # --- rule: NULL-DEREF + PARAM-RAW-NOCHECK
             for am in ARROW_RE.finditer(line):
                 var = am.group(1)
-                # gather guards in window
                 start = max(0, idx - lookback)
                 guards = scan_guards(body_lines[start:idx+1])
                 if var not in guards:
@@ -189,7 +168,6 @@ def analyze_file(path, issues):
                     issues.append(Issue("PARAM-RAW-NOCHECK", path, ln, am.start(1)+1,
                         f"Raw pointer parameter '{var}' used via '->' without visible guard.",
                         raw.strip()))
-            # --- rule: ADDR-ESCAPE (this->... = &local)
             m1 = THIS_ASSIGN_ADDR_RE.search(line)
             if m1:
                 v = m1.group(1)
@@ -197,7 +175,6 @@ def analyze_file(path, issues):
                     issues.append(Issue("ADDR-ESCAPE", path, ln, m1.start(1)+1,
                         f"Taking address of local '{v}' and storing to member — lifetime risk.",
                         raw.strip()))
-            # --- rule: ADDR-ESCAPE global/static (very heuristic)
             m2 = GLOBAL_ASSIGN_ADDR_RE.search(line)
             if m2:
                 v = m2.group(1)
@@ -206,44 +183,71 @@ def analyze_file(path, issues):
                         f"Taking address of local '{v}' and storing globally — lifetime risk.",
                         raw.strip()))
 
-def main():
-    if len(sys.argv) != 2:
-        print("Usage: python compile_preprocessor.py <PROJECT_DIRECTORY>", file=sys.stderr)
-        sys.exit(2)
-    root = os.path.abspath(sys.argv[1])
-    if not os.path.isdir(root):
-        print(f"Not a directory: {root}", file=sys.stderr)
-        sys.exit(2)
+def print_report(root, issues, cycles, mode):
+    total = len(issues) + len(cycles)
+    root = os.path.abspath(root)
 
-    # 1) include graph + cycle check
-    graph = build_include_graph(root)
-    cycles = find_include_cycles(graph)
+    def rel(p): 
+        try: return os.path.relpath(p, root)
+        except: return p
 
-    issues = []
-    for p in iter_files(root):
-        try:
-            analyze_file(str(p), issues)
-        except Exception as e:
-            print(f"[warn] failed to analyze {p}: {e}", file=sys.stderr)
+    if mode == "FREE":
+        print(f"[FREE] issues={total} (code={len(issues)}, include_cycles={len(cycles)})")
+        return 0  # never fail build
 
-    # print report
+    # WARNING / ABORT -> verbose details
+    print(f"[{mode}] Summary: total={total}, code={len(issues)}, include_cycles={len(cycles)}")
     if cycles:
         print("== Include Cycles ==")
         for cyc in cycles:
-            print("  [INCLUDE-CYCLE] " + " -> ".join(cyc))
+            chain = " -> ".join(rel(x) for x in cyc)
+            print(f"  [INCLUDE-CYCLE] {chain}")
         print()
 
     if issues:
         print("== Issues ==")
         for it in issues:
-            rel = os.path.relpath(it.file, root)
-            print(f"{rel}:{it.line}:{it.col}: [{it.tag}] {it.msg}")
+            print(f"{rel(it.file)}:{it.line}:{it.col}: [{it.tag}] {it.msg}")
             if it.snippet:
                 print(f"    {it.snippet}")
-        sys.exit(1 if issues else 0)
-    else:
-        print("[ok] no issues found")
-        sys.exit(0)
+
+    # WARNING never fails, ABORT fails if there are problems
+    if mode == "WARNING":
+        return 0
+    if mode == "ABORT":
+        return 1 if total > 0 else 0
+    # Fallback safe
+    return 0
+
+def main():
+    ap = argparse.ArgumentParser(description="Heuristic, compiler-agnostic static checks for C/C++ projects.")
+    ap.add_argument("project_dir", help="Project root directory")
+    ap.add_argument("--mode", choices=["FREE","WARNING","ABORT"], default="WARNING",
+                    help="FREE: print counts only, never fail; WARNING: details, never fail; ABORT: details, fail on issues.")
+    ap.add_argument("--lookback", type=int, default=6, help="Lines to look back for null guards (default: 6)")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="Substring pattern to exclude (can repeat). Example: --exclude third_party --exclude build")
+    args = ap.parse_args()
+
+    root = os.path.abspath(args.project_dir)
+    if not os.path.isdir(root):
+        print(f"Not a directory: {root}", file=sys.stderr)
+        sys.exit(2)
+
+    # 1) include graph + cycles
+    graph = build_include_graph(root, args.exclude)
+    cycles = find_include_cycles(graph)
+
+    # 2) per-file analysis
+    issues = []
+    for p in iter_files(root, args.exclude):
+        try:
+            analyze_file(str(p), issues, args.lookback)
+        except Exception as e:
+            print(f"[warn] failed to analyze {p}: {e}", file=sys.stderr)
+
+    code = print_report(root, issues, cycles, args.mode)
+    sys.exit(code)
 
 if __name__ == "__main__":
     main()
