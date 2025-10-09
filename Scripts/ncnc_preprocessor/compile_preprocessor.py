@@ -71,8 +71,7 @@ def find_include_cycles(graph):
                 dfs(v, path + [v])
             elif v in stack:
                 if v in path:
-                    i = path.index(v)
-                    cyc = path[i:] + [v]
+                    i = path.index(v); cyc = path[i:] + [v]
                 else:
                     cyc = [v, u, v]
                 cycles.append(cyc)
@@ -139,7 +138,25 @@ def scan_guards(window_lines):
                             break
     return guards
 
-def analyze_file(path, issues, lookback):
+class FailFast(object):
+    def __init__(self, mode="WARNING", limit=0, root="."):
+        self.mode = mode
+        self.limit = max(0, int(limit))
+        self.count = 0
+        self.root = os.path.abspath(root)
+    def rel(self, p):
+        try: return os.path.relpath(p, self.root)
+        except: return p
+    def hit_issue(self, issue):
+        self.count += 1
+        print("{}:{}:{}: [{}] {}".format(self.rel(issue.file), issue.line, issue.col, issue.tag, issue.msg))
+        if issue.snippet:
+            print("    {}".format(issue.snippet))
+        if self.mode == "TERMINATE" and self.count > self.limit:
+            print("[TERMINATE] limit exceeded (count={} > limit={}). Stopping.".format(self.count, self.limit))
+            sys.exit(1)
+
+def analyze_file(path, issues, lookback, ff=None):
     txt = read_text(path)
     if not txt: return
     funcs = split_functions(txt)
@@ -153,35 +170,45 @@ def analyze_file(path, issues, lookback):
             ln = f_start_line + idx + 1
             dm = DELETE_RE.search(line)
             if dm:
-                issues.append(Issue("RAW-DELETE", path, ln, dm.start()+1,
+                issue = Issue("RAW-DELETE", path, ln, dm.start()+1,
                     "Avoid raw 'delete'/'delete[]' — prefer RAII (unique_ptr/shared_ptr) or custom deleter.",
-                    raw.strip()))
+                    raw.strip())
+                issues.append(issue)
+                if ff: ff.hit_issue(issue)
             for am in ARROW_RE.finditer(line):
                 var = am.group(1)
                 start = max(0, idx - lookback)
                 guards = scan_guards(body_lines[start:idx+1])
                 if var not in guards:
-                    issues.append(Issue("NULL-DEREF", path, ln, am.start(1)+1,
-                        f"Pointer '{var}' may be dereferenced without a preceding null-check in nearby scope.",
-                        raw.strip()))
+                    issue = Issue("NULL-DEREF", path, ln, am.start(1)+1,
+                        "Pointer '{}' may be dereferenced without a preceding null-check in nearby scope.".format(var),
+                        raw.strip())
+                    issues.append(issue)
+                    if ff: ff.hit_issue(issue)
                 if var in params and var not in guards:
-                    issues.append(Issue("PARAM-RAW-NOCHECK", path, ln, am.start(1)+1,
-                        f"Raw pointer parameter '{var}' used via '->' without visible guard.",
-                        raw.strip()))
+                    issue = Issue("PARAM-RAW-NOCHECK", path, ln, am.start(1)+1,
+                        "Raw pointer parameter '{}' used via '->' without visible guard.".format(var),
+                        raw.strip())
+                    issues.append(issue)
+                    if ff: ff.hit_issue(issue)
             m1 = THIS_ASSIGN_ADDR_RE.search(line)
             if m1:
                 v = m1.group(1)
                 if v in locals_set:
-                    issues.append(Issue("ADDR-ESCAPE", path, ln, m1.start(1)+1,
-                        f"Taking address of local '{v}' and storing to member — lifetime risk.",
-                        raw.strip()))
+                    issue = Issue("ADDR-ESCAPE", path, ln, m1.start(1)+1,
+                        "Taking address of local '{}' and storing to member — lifetime risk.".format(v),
+                        raw.strip())
+                    issues.append(issue)
+                    if ff: ff.hit_issue(issue)
             m2 = GLOBAL_ASSIGN_ADDR_RE.search(line)
             if m2:
                 v = m2.group(1)
                 if v in locals_set:
-                    issues.append(Issue("ADDR-ESCAPE", path, ln, m2.start(1)+1,
-                        f"Taking address of local '{v}' and storing globally — lifetime risk.",
-                        raw.strip()))
+                    issue = Issue("ADDR-ESCAPE", path, ln, m2.start(1)+1,
+                        "Taking address of local '{}' and storing globally — lifetime risk.".format(v),
+                        raw.strip())
+                    issues.append(issue)
+                    if ff: ff.hit_issue(issue)
 
 def print_report(root, issues, cycles, mode):
     total = len(issues) + len(cycles)
@@ -192,59 +219,80 @@ def print_report(root, issues, cycles, mode):
         except: return p
 
     if mode == "FREE":
-        print(f"[FREE] issues={total} (code={len(issues)}, include_cycles={len(cycles)})")
+        print("[FREE] issues={} (code={}, include_cycles={})".format(total, len(issues), len(cycles)))
         return 0  # never fail build
 
+    if mode == "TERMINATE":
+        # In TERMINATE we already printed issues as they occurred; still show quick counts.
+        print("[TERMINATE] scanned summary: issues={}, include_cycles={}".format(len(issues), len(cycles)))
+        # Exit code should already be set when limit exceeded; if not exceeded, success.
+        return 0
+
     # WARNING / ABORT -> verbose details
-    print(f"[{mode}] Summary: total={total}, code={len(issues)}, include_cycles={len(cycles)}")
+    print("[{}] Summary: total={}, code={}, include_cycles={}".format(mode, total, len(issues), len(cycles)))
     if cycles:
         print("== Include Cycles ==")
         for cyc in cycles:
             chain = " -> ".join(rel(x) for x in cyc)
-            print(f"  [INCLUDE-CYCLE] {chain}")
+            print("  [INCLUDE-CYCLE] {}".format(chain))
         print()
 
     if issues:
         print("== Issues ==")
         for it in issues:
-            print(f"{rel(it.file)}:{it.line}:{it.col}: [{it.tag}] {it.msg}")
+            print("{}:{}:{}: [{}] {}".format(rel(it.file), it.line, it.col, it.tag, it.msg))
             if it.snippet:
-                print(f"    {it.snippet}")
+                print("    {}".format(it.snippet))
 
-    # WARNING never fails, ABORT fails if there are problems
     if mode == "WARNING":
         return 0
     if mode == "ABORT":
         return 1 if total > 0 else 0
-    # Fallback safe
     return 0
 
 def main():
     ap = argparse.ArgumentParser(description="Heuristic, compiler-agnostic static checks for C/C++ projects.")
     ap.add_argument("project_dir", help="Project root directory")
-    ap.add_argument("--mode", choices=["FREE","WARNING","ABORT"], default="WARNING",
-                    help="FREE: print counts only, never fail; WARNING: details, never fail; ABORT: details, fail on issues.")
+    ap.add_argument("--mode", choices=["FREE","WARNING","ABORT","TERMINATE"], default="WARNING",
+                    help="FREE: print counts only; WARNING: details; ABORT: details, fail on issues; TERMINATE: fail-fast (with --limit).")
     ap.add_argument("--lookback", type=int, default=6, help="Lines to look back for null guards (default: 6)")
     ap.add_argument("--exclude", action="append", default=[],
                     help="Substring pattern to exclude (can repeat). Example: --exclude third_party --exclude build")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="TERMINATE only: number of issues allowed before failing (fail when count > limit). Default 0 (fail on first).")
     args = ap.parse_args()
 
     root = os.path.abspath(args.project_dir)
     if not os.path.isdir(root):
-        print(f"Not a directory: {root}", file=sys.stderr)
+        print("Not a directory: {}".format(root), file=sys.stderr)
         sys.exit(2)
 
     # 1) include graph + cycles
     graph = build_include_graph(root, args.exclude)
     cycles = find_include_cycles(graph)
 
-    # 2) per-file analysis
+    if args.mode == "TERMINATE":
+        ff = FailFast(mode="TERMINATE", limit=args.limit, root=root)
+        # count include cycles first (fail-fast)
+        for cyc in cycles:
+            chain = " -> ".join(os.path.relpath(x, root) if x.startswith(root) else x for x in cyc)
+            issue = Issue("INCLUDE-CYCLE", cyc[0], 1, 1, "Include cycle detected: {}".format(chain), "")
+            ff.hit_issue(issue)
+        # 2) per-file analysis (fail-fast on each hit)
+        issues = []
+        for p in iter_files(root, args.exclude):
+            analyze_file(str(p), issues, args.lookback, ff=ff)
+        # If we get here, limit not exceeded
+        print("[TERMINATE] No failure (count <= limit={}).".format(args.limit))
+        sys.exit(0)
+
+    # Non-TERMINATE: collect all
     issues = []
     for p in iter_files(root, args.exclude):
         try:
-            analyze_file(str(p), issues, args.lookback)
+            analyze_file(str(p), issues, args.lookback, ff=None)
         except Exception as e:
-            print(f"[warn] failed to analyze {p}: {e}", file=sys.stderr)
+            print("[warn] failed to analyze {}: {}".format(p, e), file=sys.stderr)
 
     code = print_report(root, issues, cycles, args.mode)
     sys.exit(code)
