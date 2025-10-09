@@ -8,6 +8,8 @@
 python compile_preprocessor.py <TARGET_DIRECTORY> --mode FREE
 python compile_preprocessor.py <TARGET_DIRECTORY> --mode WARNING
 python compile_preprocessor.py <TARGET_DIRECTORY> --mode ABORT
+python compile_preprocessor.py <TARGET_DIRECTORY> --mode TERMINATE
+python compile_preprocessor.py <TARGET_DIRECTORY> --mode TERMINATE --limit <ERROR_COUNT>
 ```
 
 ### Output
@@ -65,6 +67,29 @@ b.cpp:7:5: [NULL-DEREF] Pointer 't' may be dereferenced without a preceding null
     t->x++;
 b.cpp:8:12: [NULL-DEREF] Pointer 't' may be dereferenced without a preceding null-check in nearby scope.
     return t->x;
+```
+
+
+```
+python compile_preprocessor.py src --mode TERMINATE
+
+a.cpp:10:9: [RAW-DELETE] Avoid raw 'delete'/'delete[]' — prefer RAII (unique_ptr/shared_ptr) or custom deleter.
+    delete owner_;          // RAW-DELETE: pretend A doesn't own it always
+[TERMINATE] limit exceeded (count=1 > limit=0). Stopping.
+```
+
+
+```
+python compile_preprocessor.py src --mode TERMINATE --limit 2
+
+a.cpp:10:9: [RAW-DELETE] Avoid raw 'delete'/'delete[]' — prefer RAII (unique_ptr/shared_ptr) or custom deleter.
+    delete owner_;          // RAW-DELETE: pretend A doesn't own it always
+a.cpp:18:12: [NULL-DEREF] Pointer 'owner_' may be dereferenced without a preceding null-check in nearby scope.
+    return owner_->value;       // NULL-DEREF
+a.cpp:23:12: [NULL-DEREF] Pointer 'left' may be dereferenced without a preceding null-check in nearby scope.
+    return left->value + right->value; // PARAM-RAW-NOCHECK + NULL-DEREF
+[TERMINATE] limit exceeded (count=3 > limit=2). Stopping.
+
 ```
 
 
